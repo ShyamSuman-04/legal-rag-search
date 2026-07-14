@@ -1,0 +1,28 @@
+# ==========================================================
+# US Tax & Legal RAG System
+# Deployment requirements for FastAPI + Streamlit runtime
+# ==========================================================
+
+# API server
+fastapi==0.139.0
+uvicorn[standard]
+pydantic==2.13.4
+
+
+# Frontend
+streamlit
+requests
+
+# Environment variables
+python-dotenv
+
+# Core retrieval / embedding runtime
+numpy
+sentence-transformers==5.6.0
+torch
+
+# Search backend
+elasticsearch==9.4.1
+
+# LLM backend
+groq==0.37.1
