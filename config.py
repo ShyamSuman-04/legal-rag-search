@@ -1,4 +1,5 @@
 import os
+import random
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -78,6 +79,7 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 # Embedding Configuration
 # ===========================
 
+#EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 
@@ -120,13 +122,24 @@ RERANK_TOP_K = 4
 # LLM Configuration
 # ===========================
 
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "openai/gpt-oss-20b",
+]
+random.shuffle(GROQ_MODELS)
+
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Randomly choose one model each time the application starts
+GROQ_MODEL = random.choice(GROQ_MODELS)
 
 LLM_CONTEXT_TOKEN_BUDGET = 6500
 
-LLM_RESERVED_TOKEN_BUDGET = 1500
+LLM_RESERVED_TOKEN_BUDGET = 2500
 
 # ===========================
 # Evaluation Configuration

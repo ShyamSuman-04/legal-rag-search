@@ -1,3 +1,4 @@
+
 """
 groq_client.py
 
@@ -8,23 +9,27 @@ Responsibilities
 ----------------
 - Creates and manages the Groq client
 - Sends prompts to the configured LLM
+- Automatically falls back to the next preferred model
+  if the current model errors out (e.g. rate limited / 429)
 - Returns generated responses
 - Logs latency and token usage
 - Performs health checks
 
-Author: Divyansh Kumar
+Author: Shyam Suman
 Project: US Tax & Legal RAG System
 """
 
 import logging
+import random
 import time
-from typing import Dict
+from typing import Dict, List, Optional
 
 from groq import Groq
 
 from config import (
     GROQ_API_KEY,
     GROQ_MODEL,
+    GROQ_MODELS,
 )
 
 # ---------------------------------------------------------------------
@@ -48,7 +53,10 @@ class GroqClient:
     Reusable Groq client.
 
     The client is created once and reused for every
-    prompt generation request.
+    prompt generation request. If a model call fails
+    (rate limit, timeout, server error, etc.), the client
+    automatically retries the same request on the next
+    model in `GROQ_MODELS`, in order.
     """
 
     def __init__(self):
@@ -57,15 +65,31 @@ class GroqClient:
                 "GROQ_API_KEY not found in environment."
             )
 
+        # Build the ordered list of models to try.
+        # Falls back to a single-model list (GROQ_MODEL) if
+        # GROQ_MODELS is missing/empty in config.
+        self.models: List[str] = list(GROQ_MODELS) if GROQ_MODELS else [GROQ_MODEL]
+
+        # Shuffle the fallback order once per client startup. This
+        # spreads traffic (and rate-limit exposure) evenly across
+        # models instead of always sending the majority of requests
+        # to whichever model happens to be first in config.py. The
+        # order is fixed for the lifetime of this client instance,
+        # so fallback behaviour within a run stays predictable.
+        random.shuffle(self.models)
+
+        # Keep the default/primary model around for logging & reference.
+        self.model = self.models[0]
+
         logger.info("=" * 65)
         logger.info("Initializing Groq Client")
-        logger.info("Model : %s", GROQ_MODEL)
+        logger.info("Primary Model : %s", self.model)
+        logger.info("Fallback Order (shuffled) : %s", self.models)
 
         try:
             self.client = Groq(
                 api_key=GROQ_API_KEY
             )
-            self.model = GROQ_MODEL
         except Exception as error:
             logger.exception(
                 "Failed to initialize Groq client."
@@ -79,14 +103,213 @@ class GroqClient:
 
     # -----------------------------------------------------------------
 
+    # HTTP status codes that are considered PERMANENT failures.
+    # Retrying these against another model wastes calls, since every
+    # model will fail for the same reason (bad key, bad request, etc.).
+    _PERMANENT_STATUS_CODES = {400, 401, 403, 404, 422}
+
+    # HTTP status codes that are considered TRANSIENT and worth
+    # retrying on the next model in the fallback list.
+    _TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+
+    def _get_status_code(self, error: Exception) -> Optional[int]:
+        """
+        Best-effort extraction of an HTTP status code from an
+        exception, across the different shapes the Groq SDK
+        (built on `httpx`/`openai`-style clients) may raise.
+        """
+        status_code = getattr(error, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+
+        response = getattr(error, "response", None)
+        if response is not None:
+            response_status = getattr(response, "status_code", None)
+            if isinstance(response_status, int):
+                return response_status
+
+        return None
+
+    def _is_permanent_error(self, error: Exception) -> bool:
+        """
+        Identifies errors that will fail the SAME WAY on every model,
+        so falling back is pointless: bad/expired API key, malformed
+        request, prompt too long, forbidden access, etc.
+        """
+        status_code = self._get_status_code(error)
+        if status_code is not None:
+            return status_code in self._PERMANENT_STATUS_CODES
+
+        # Fall back to matching on the error's class name / message,
+        # for SDK exceptions that don't expose a status_code cleanly.
+        error_name = type(error).__name__.lower()
+        error_text = str(error).lower()
+
+        permanent_markers = (
+            "authenticationerror",
+            "permissiondeniederror",
+            "badrequesterror",
+            "notfounderror",
+            "unprocessableentityerror",
+        )
+        if any(marker in error_name for marker in permanent_markers):
+            return True
+
+        permanent_phrases = (
+            "invalid api key",
+            "incorrect api key",
+            "unauthorized",
+            "forbidden",
+            "invalid request",
+        )
+        return any(phrase in error_text for phrase in permanent_phrases)
+
+    def _is_transient_error(self, error: Exception) -> bool:
+        """
+        Identifies errors worth retrying on the next model: rate
+        limits, server-side errors, timeouts, and connection issues.
+        """
+        status_code = self._get_status_code(error)
+        if status_code is not None:
+            return status_code in self._TRANSIENT_STATUS_CODES
+
+        error_name = type(error).__name__.lower()
+        error_text = str(error).lower()
+
+        transient_markers = (
+            "ratelimiterror",
+            "apitimeouterror",
+            "apiconnectionerror",
+            "internalservererror",
+            "serviceunavailableerror",
+            "timeout",
+            "connectionerror",
+        )
+        if any(marker in error_name for marker in transient_markers):
+            return True
+
+        transient_phrases = (
+            "429",
+            "rate limit",
+            "timed out",
+            "timeout",
+            "connection",
+            "500",
+            "502",
+            "503",
+            "504",
+        )
+        return any(phrase in error_text for phrase in transient_phrases)
+
+    # -----------------------------------------------------------------
+
+    def _call_with_fallback(
+        self,
+        *,
+        messages: list,
+        temperature: float,
+        max_completion_tokens: int,
+        timeout: int,
+    ):
+        """
+        Attempts the chat completion request across all models in
+        `self.models`, in order, stopping at the first success.
+
+        Behaviour on failure:
+        - TRANSIENT errors (429 rate limit, 500/502/503/504, timeouts,
+          connection errors) -> logged, and the next model is tried.
+        - PERMANENT errors (400, 401, 403, 404, 422 - bad key,
+          malformed request, forbidden, etc.) -> raised immediately,
+          without wasting calls on the remaining models, since they
+          would fail the same way.
+        - Any other/unclassified error -> treated as transient (safe
+          default) so a single unexpected error type doesn't abort
+          the whole fallback chain.
+
+        Raises
+        ------
+        RuntimeError
+            If a permanent error occurs, or if every model in the
+            fallback list is exhausted due to transient errors.
+        """
+        last_error: Optional[Exception] = None
+
+        for index, model_name in enumerate(self.models, start=1):
+            try:
+                logger.info(
+                    "Attempting model %d/%d : %s",
+                    index,
+                    len(self.models),
+                    model_name,
+                )
+
+                completion = self.client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_completion_tokens=max_completion_tokens,
+                    timeout=timeout,
+                )
+
+                logger.info(
+                    "Model succeeded : %s",
+                    model_name,
+                )
+
+                return completion, model_name
+
+            except Exception as error:
+                last_error = error
+
+                if self._is_permanent_error(error):
+                    logger.error(
+                        "Permanent error on model %s : %s | "
+                        "Not retrying other models.",
+                        model_name,
+                        error,
+                    )
+                    raise RuntimeError(
+                        f"Groq request failed permanently on model "
+                        f"'{model_name}': {error}"
+                    ) from error
+
+                if self._is_transient_error(error):
+                    logger.warning(
+                        "Transient error on model %s : %s | "
+                        "Trying next model...",
+                        model_name,
+                        error,
+                    )
+                else:
+                    logger.warning(
+                        "Unclassified error on model %s : %s | "
+                        "Trying next model as a precaution...",
+                        model_name,
+                        error,
+                    )
+                continue
+
+        logger.exception(
+            "All models in fallback list failed.",
+            exc_info=last_error,
+        )
+        raise RuntimeError(
+            f"All Groq models failed. Last error: {last_error}"
+        ) from last_error
+
+    # -----------------------------------------------------------------
+
     def health_check(self) -> bool:
         """
         Performs a lightweight API health check.
 
         Sends a tiny request to verify that:
         - API key is valid
-        - model exists
+        - at least one configured model works
         - network connection works
+
+        Automatically falls back across `self.models` if the
+        first model is unavailable/rate-limited.
 
         Returns
         -------
@@ -97,16 +320,10 @@ class GroqClient:
         logger.info("Running Groq Health Check")
         logger.info("=" * 65)
 
-        logger.info("=" * 65)
-        logger.info("Running Groq Health Check")
-        logger.info("=" * 65)
-
         try:
-
             start_time = time.perf_counter()
 
-            completion = self.client.chat.completions.create(
-                model=self.model,
+            completion, model_used = self._call_with_fallback(
                 messages=[
                     {
                         "role": "user",
@@ -117,6 +334,7 @@ class GroqClient:
                 max_completion_tokens=5,
                 timeout=30,
             )
+
             print("\n================ RAW COMPLETION ================\n")
             print(completion)
             print("\n===============================================\n")
@@ -124,7 +342,7 @@ class GroqClient:
             latency = time.perf_counter() - start_time
 
             logger.info("Groq Health Check Passed.")
-            logger.info("Model : %s", self.model)
+            logger.info("Model Used : %s", model_used)
             logger.info("Latency : %.2f seconds", latency)
 
             # Optional: log the returned text for debugging
@@ -138,12 +356,9 @@ class GroqClient:
 
             return True
 
-        except Exception as error:
-
+        except Exception:
             logger.exception("Groq Health Check Failed.")
-
             logger.info("=" * 65)
-
             return False
 
     # -----------------------------------------------------------------
@@ -158,9 +373,14 @@ class GroqClient:
         """
         Sends a prompt to Groq and returns the generated response.
 
+        If the first (preferred) model fails - for example it is
+        rate limited (HTTP 429), times out, or errors - the request
+        is automatically retried on the next model in
+        `config.GROQ_MODELS`, until one succeeds or all are exhausted.
+
         Parameters
         ----------
-        prompt : str
+        prompt_text : str
             Complete prompt generated by PromptBuilder.
 
         temperature : float
@@ -191,7 +411,7 @@ class GroqClient:
 
         logger.info("=" * 65)
         logger.info("Generating LLM Response")
-        logger.info("Model : %s", self.model)
+        logger.info("Fallback Order : %s", self.models)
         logger.info(
             "Prompt Characters : %d",
             len(prompt_text),
@@ -201,8 +421,7 @@ class GroqClient:
         start_time = time.perf_counter()
 
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
+            completion, model_used = self._call_with_fallback(
                 messages=[
                     {
                         "role": "user",
@@ -214,16 +433,12 @@ class GroqClient:
                 timeout=timeout,
             )
 
-            # print("\n")
-            # print("=" * 80)
-            # print("RAW GROQ RESPONSE")
-            # print("=" * 80)
-
-            # print(completion)
-
-            # print("=" * 80)
             print()
 
+            logger.info(
+                "Model Used : %s",
+                model_used,
+            )
             logger.info(
                 "Finish Reason : %s",
                 completion.choices[0].finish_reason,
@@ -300,7 +515,7 @@ class GroqClient:
 
             return {
                 "answer": answer,
-                "model": self.model,
+                "model": model_used,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
@@ -312,7 +527,7 @@ class GroqClient:
 
         except Exception as error:
             logger.exception(
-                "Groq generation failed."
+                "Groq generation failed on all fallback models."
             )
             raise RuntimeError(
                 "Failed to generate response from Groq."
@@ -329,9 +544,10 @@ def main():
 
     This allows independent verification of:
     - API Key
-    - Model
+    - Model(s)
     - Network connectivity
     - Response generation
+    - Automatic model fallback behaviour
 
     before integrating with the RAG pipeline.
     """
@@ -367,7 +583,7 @@ def main():
 
                 print("\n")
                 print("=" * 80)
-                print("MODEL")
+                print("MODEL USED")
                 print("=" * 80)
                 print(response["model"])
 
